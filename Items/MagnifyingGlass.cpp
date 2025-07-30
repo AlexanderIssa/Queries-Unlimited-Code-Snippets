@@ -27,12 +27,7 @@ AMagnifyingGlass::AMagnifyingGlass()
 	StaticMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StaticMesh"));
 	// Parent the Root with the Mesh
 	StaticMesh->SetupAttachment(Root);
-
-	// Create the Skeletal Mesh
-	GlassSkeletalMesh = CreateDefaultSubobject<USkeletalMeshComponent>(TEXT("SkeletalMesh"));
-	// Parent the Root with the Skeleton
-	GlassSkeletalMesh->SetupAttachment(Root);
-
+	
 	// Create a default Scene Comp
 	MiddleOfLens = CreateDefaultSubobject<USceneComponent>(TEXT("MiddleOfLens"));
 	// Parent the SM with the Scene Comp
@@ -81,6 +76,7 @@ void AMagnifyingGlass::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	DOREPLIFETIME(AMagnifyingGlass, mUserCharacter);
+	DOREPLIFETIME(AMagnifyingGlass, bIsHeldUp);
 }
 
 void AMagnifyingGlass::RevealHiddenObjects()
@@ -175,25 +171,28 @@ void AMagnifyingGlass::RevealHiddenObjects()
 				}
 			}
 		}
-		// Now check for actors that are no longer being looked at
-		for (auto& Elem : mRevealedActorsMap)
-		{
-			AHiddenActor* RevealedActor = Elem.Value;
-            
-			// If the revealed actor is not in the currently looked-at set, hide it again
-			if (!CurrentLookedAtActors.Contains(RevealedActor))
-			{
-				RevealedActor->SetActorHiddenInGame(true);
-				RevealedActor->SetIsBeingLookedAt(false);
 
-				// Optionally remove it from the map if you don't need to track it anymore
-				mRevealedActorsMap.Remove(Elem.Key);
+		TArray<FString> KeysToRemove;
+		// Now check for actors that are no longer being looked at
+		for (const auto& Elem : mRevealedActorsMap)
+		{
+			if (!CurrentLookedAtActors.Contains(Elem.Value))
+			{
+				Elem.Value->SetActorHiddenInGame(true);
+				Elem.Value->SetIsBeingLookedAt(false);
+				KeysToRemove.Add(Elem.Key);
 
 				if (bShowDebug)
 				{
-					GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red, FString::Printf(TEXT("Hiding Actor")));
+					GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red, TEXT("Hiding Actor"));
 				}
 			}
+		}
+
+		// Now remove safely outside the loop
+		for (const FString& Key : KeysToRemove)
+		{
+			mRevealedActorsMap.Remove(Key);
 		}
 	}
 }
@@ -213,28 +212,26 @@ void AMagnifyingGlass::LowerMagnifyingGlass(ANetworkingPrototypeCharacter* UserC
 		RevealedActor->SetActorHiddenInGame(true);
 		RevealedActor->SetIsBeingLookedAt(false);
 
-		// Optionally remove it from the map if you don't need to track it anymore
-		mRevealedActorsMap.Remove(Elem.Key);
-
 		if (bShowDebug)
 		{
 			GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red, FString::Printf(TEXT("Hiding all Hidden Actors")));
 		}
 	}
 
+	// Clear our revealed actors map
+	mRevealedActorsMap.Empty();
+
 	// Play the lowering len's animation to all clients including the owning client's
-	if (mUserCharacter->HasAuthority())
-	{
-		Multicast_PlayLowerLensAnim();
-	}
-	else
-	{
-		Server_PlayLowerLensAnim();
-	}
+	Server_PlayLowerLensAnim();
 
 }
 
 void AMagnifyingGlass::OnPickupItem(ANetworkingPrototypeCharacter* Interactor)
+{
+	Server_OnPickupItem(Interactor);
+}
+
+void AMagnifyingGlass::Server_OnPickupItem_Implementation(ANetworkingPrototypeCharacter* Interactor)
 {
 	if (!Interactor)
 	{
@@ -247,78 +244,25 @@ void AMagnifyingGlass::OnPickupItem(ANetworkingPrototypeCharacter* Interactor)
 
 void AMagnifyingGlass::Server_PlayLowerLensAnim_Implementation()
 {
-	Multicast_PlayLowerLensAnim();
-}
-
-void AMagnifyingGlass::Multicast_PlayLowerLensAnim_Implementation()
-{
-
-	// Post the new state to any BP listeners
-	OnStateChanged.Broadcast(false);
-	
-	// if (!mUserCharacter)
-	// {
-	// 	UE_LOG(LogMagnifyingGlass, Error, TEXT("Multicast: mUserCharacter is not valid!"));
-	// 	return;
-	// }
-	
-	// // Play Magnifying Glass' use animation here
-	// // Only move the glass on the owning client, not locally on other clients
-	// if (mUserCharacter->IsLocallyControlled())
-	// {		
-	// 	// Post the new state to any BP listeners
-	// 	OnStateChanged.Broadcast(false);
-	// }
-	// else
-	// {
-	// 	// this is where to play the 3rd person animation for all other clients to see that aren't the
-	// 	// owning client
-	// 	OnStateChanged.Broadcast(false);
-	// }
-
+	//Multicast_PlayLowerLensAnim();
+	bIsHeldUp = false;
+	OnRep_IsHeldUp();
 }
 
 /*
  * @brief Use the Magnifying Glass server side.
- * Calls Multicast_UseItem() so that every client
+ * Calls OnRep_IsHeldUp() so that every client
  * can see that the owner of this item is playing
  * a specific animation.
  */
 void AMagnifyingGlass::Server_UseItem_Implementation(AActor* user)
 {
 	// Tell all clients and the server about the glass' new state
-	Multicast_UseItem(user);
+	bIsHeldUp = true;
+	OnRep_IsHeldUp();
 }
 
-/*
- * @brief Use the Magnifying Glass multicasted server side.
- * Run any functionality that should run for all clients
- * when the owner of this item uses it. Such as playing
- * an animation on the owner's character server wide.
- */
-void AMagnifyingGlass::Multicast_UseItem_Implementation(AActor* user)
+void AMagnifyingGlass::OnRep_IsHeldUp()
 {
-
-	// Post the new state to any BP listeners
-	OnStateChanged.Broadcast(true);
-	
-	// if (!mUserCharacter)
-	// {
-	// 	UE_LOG(LogMagnifyingGlass, Error, TEXT("Multicast: mUserCharacter is not valid!"));
-	// 	return;
-	// }
-	
-	// // Play Magnifying Glass' use animation here
-	// // Only move the glass on the owning client, not locally on other clients
-	// if (mUserCharacter->IsLocallyControlled())
-	// {		
-	// 	// Post the new state to any BP listeners
-	// 	OnStateChanged.Broadcast(true);
-	// }
-	// else
-	// {
-	// 	// this is where to play the 3rd person animation for all other clients to see that aren't the
-	// 	// owning client
-	// 	OnStateChanged.Broadcast(true);
-	// }
+	OnStateChanged.Broadcast(bIsHeldUp);
 }

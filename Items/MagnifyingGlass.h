@@ -44,29 +44,33 @@ public:
 private:
 	// Helper Functions:
 
-	//
+	// The actual functionality of holding up the MG.
+	// Reveals Actors of class AHiddenActor, client side. 
 	void RevealHiddenObjects();
 
-	//
+	// Empties mRevealedActorsMap and hides all AHiddenActors,
+	// then calls Server_PlayLowerLensAnim
 	void LowerMagnifyingGlass(ANetworkingPrototypeCharacter* UserCharacter);
 
-	//
+	// Called when a player interacts with the MG pickup and spawns this item.
+	// Sets that player character as the owner of this MG.
 	UFUNCTION()
 	void OnPickupItem(ANetworkingPrototypeCharacter* Interactor);
 	
 	// Networked Functions:
-	
-	UFUNCTION(NetMulticast, Reliable)
-	void Multicast_UseItem(AActor* user);
 
+	// Server side logic for using the MG.
 	UFUNCTION(Server, Reliable)
 	void Server_UseItem(AActor* user);
 
-	UFUNCTION(NetMulticast, Reliable)
-	void Multicast_PlayLowerLensAnim();
+	// Server side logic for picking up the MG.
+	UFUNCTION(Server, Reliable)
+	void Server_OnPickupItem(ANetworkingPrototypeCharacter* Interactor);
 
+	// Server side logic for lowering the MG.
 	UFUNCTION(Server, Reliable)
 	void Server_PlayLowerLensAnim();
+
 	
 	// Member Properties
 
@@ -82,23 +86,22 @@ private:
 	UPROPERTY(EditAnywhere)
 	USceneComponent* MiddleOfLens;
 
-	// Mesh for MagnifyingGlass
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta = (AllowPrivateAccess = "true"))
-	USkeletalMeshComponent* GlassSkeletalMesh;
-
 	// Reference to our owning Character
 	// Replicated so the server always knows who is using this item
 	UPROPERTY(Replicated)
 	ANetworkingPrototypeCharacter* mUserCharacter;
 
 	// Map to hold our currently revealed actors
+	UPROPERTY()
 	TMap<FString, AHiddenActor*> mRevealedActorsMap;
-
-	// OnRep function for when mUserCharacter is replicated to clients
-	// UFUNCTION()
-	// void OnRep_UserCharacter();
 
 	// Simple bool to show/hide debug lines
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta = (AllowPrivateAccess = "true"))
 	bool bShowDebug = false;
+
+	// Replicated flag to keep track of whether the MG is being held up or not
+	UPROPERTY(ReplicatedUsing = OnRep_IsHeldUp)
+	bool bIsHeldUp;
+	UFUNCTION()
+	void OnRep_IsHeldUp();
 };
