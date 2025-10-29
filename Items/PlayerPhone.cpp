@@ -3,12 +3,13 @@
 
 #include "NetworkingPrototype/Public/PlayerPhone.h"
 
-#include "../../../Plugins/AdvancedSteamSessions/Source/AdvancedSteamSessions/Classes/AdvancedSteamFriendsLibrary.h"
 #include "Components/AudioComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "Net/UnrealNetwork.h"
 #include "NetworkingPrototype/NetworkingPrototypeCharacter.h"
 #include "OnsetVoip/Public/OnsetVoipWorldSubsystem.h"
+#include "AkGameplayStatics.h"
+#include "NetworkingPrototype/Characters/QUPlayerState.h"
 
 // Define the log category
 DEFINE_LOG_CATEGORY(LogPlayerPhone);
@@ -19,8 +20,8 @@ DEFINE_LOG_CATEGORY(LogPlayerPhone);
 // Sets default values
 APlayerPhone::APlayerPhone()
 {
- 	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
-	PrimaryActorTick.bCanEverTick = true;
+	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
+	PrimaryActorTick.bCanEverTick = false;
 
 	// Create a mesh component that will be used when being viewed from a '1st person' view (when controlling this pawn)
 	PhoneSkele = CreateDefaultSubobject<USkeletalMeshComponent>(TEXT("PhoneSkeletalMesh"));
@@ -37,6 +38,16 @@ APlayerPhone::APlayerPhone()
 	// Set Audio Parent to the phone skeleton
 	PhoneAudioComponent->SetupAttachment(PhoneSkele);
 	PhoneAudioComponent->bAutoActivate = false;
+	// Allow 3D sound
+	PhoneAudioComponent->bAllowSpatialization = true;
+
+	// Default create an audio component
+	PhoneAudioRingtoneComp = CreateDefaultSubobject<UAudioComponent>(TEXT("PhoneAudioRingtoneComp"));
+	// Set Audio Parent to the phone skeleton
+	PhoneAudioRingtoneComp->SetupAttachment(PhoneSkele);
+	PhoneAudioRingtoneComp->bAutoActivate = false;
+	// Allow 3D sound
+	PhoneAudioRingtoneComp->bAllowSpatialization = true;
 
 	// Phone screen widget
 	PhoneScreenWidgetPopUp = CreateDefaultSubobject<UWidgetComponent>(TEXT("PhoneScreenWidget"));
@@ -52,7 +63,7 @@ APlayerPhone::APlayerPhone()
 	// Phone screen light
 	PhoneScreenPLight = CreateDefaultSubobject<UPointLightComponent>(TEXT("PhoneScreenPLight"));
 	PhoneScreenPLight->SetupAttachment(PhoneSkele, PhoneScreenSocketName);
-	
+
 	// Setup networked replication
 	bReplicates = true;
 }
@@ -62,23 +73,47 @@ void APlayerPhone::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Set our owning character ref to our owning actor casted to our class
+	// Set our owning character ref to our owning actor cast to our class
 	if (!Cast<ANetworkingPrototypeCharacter>(Owner))
 	{
 		UE_LOG(LogPlayerPhone, Log, TEXT("Owner actor is not the right class!"));
 	}
 	mOwningCharacter = Cast<ANetworkingPrototypeCharacter>(Owner);
 
+	// Set visibility of our widget comp and phone lights to false by default
 	PhoneScreenWidgetPopUp->SetVisibility(false);
 	PhoneScreenLight->SetVisibility(false);
 	PhoneScreenPLight->SetVisibility(false);
+
+	ULocalPlayer* LocalPlayer = GetWorld()->GetFirstLocalPlayerFromController();
+	if (LocalPlayer)
+	{
+		PhoneScreenWidgetPopUp->SetOwnerPlayer(LocalPlayer);
+	}
+
+	// Get the widget component's widget and store it under mPlayerPhoneWidget
+	if (PhoneScreenWidgetPopUp->GetWidget())
+	{
+		mPlayerPhoneWidget = Cast<UPlayerPhoneWidget>(PhoneScreenWidgetPopUp->GetWidget());
+
+		if (!mPlayerPhoneWidget)
+		{
+			UE_LOG(LogPlayerPhone, Error, TEXT("PhoneScreenWidgetPopUp->GetWidget() is not the right class!"));
+		}
+
+		APlayerController* PC = GetWorld()->GetFirstPlayerController();
+		if (PC)
+		{
+			mPlayerPhoneWidget->SetOwningPlayer(PC);
+		}
+	}
 }
 
 // Called every frame
 void APlayerPhone::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
-	
+
 }
 
 void APlayerPhone::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -87,6 +122,8 @@ void APlayerPhone::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLife
 
 	DOREPLIFETIME(APlayerPhone, mCurrentChannel);
 	DOREPLIFETIME(APlayerPhone, bIsInCall);
+	DOREPLIFETIME(APlayerPhone, PhoneAudioComponent);
+	DOREPLIFETIME(APlayerPhone, PhoneAudioRingtoneComp);
 }
 
 void APlayerPhone::Client_NotifyCallReceived_Implementation(APlayerState* CallerPlayerState, APlayerPhone* CallerPhone, uint32 ChannelID)
@@ -95,62 +132,130 @@ void APlayerPhone::Client_NotifyCallReceived_Implementation(APlayerState* Caller
 	{
 		return;
 	}
-	
-	// Subscribe this phone to the Caller's phone to listen
-	// for when the caller ends the call
-	//CallerPhone->OnEndCall.BindUObject(this, &APlayerPhone::OnOtherPlayerEndCall);
-	
+
 	// Broadcast the dynamic delegate to notify the client
 	OnCallReceived.Broadcast(CallerPlayerState, ChannelID);
-
-	// Optionally show the call UI on the client
-	// ShowCallUI(TargetPlayerState);
 
 	// Clear the existing timer
 	GetWorldTimerManager().ClearTimer(PhoneCallTimeoutHandle);
 
 	// Restart the timer **without resetting progress**
-	GetWorldTimerManager().SetTimer(PhoneCallTimeoutHandle, this, &APlayerPhone::PendingCallTimeout, PhoneTimeoutTime, false);
+	GetWorldTimerManager().SetTimer(PhoneCallTimeoutHandle, this, &APlayerPhone::PendingCallTimeout, CallTimeoutTime, false);
 
 	GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Green, TEXT("Call received on the client!"));
 }
 
 void APlayerPhone::Client_NotifyCallStarted_Implementation(APlayerState* TargetPlayerState, uint32 ChannelID)
-{	
+{
 	// Broadcast the dynamic delegate to notify the client
 	OnCallStarted.Broadcast(TargetPlayerState, ChannelID);
-
-	// Optionally show the call UI on the client
-	// ShowCallUI(TargetPlayerState);
 
 	GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Green, TEXT("Call started on the client!"));
 }
 
-void APlayerPhone::Server_PlayPhoneAudio_Implementation()
+void APlayerPhone::Server_PlayPhoneAudio_Implementation(APlayerPhone* TargetPhone, E_AudioType AudioType)
 {
-	Multicast_PlayPhoneAudio();
+	Multicast_PlayPhoneAudio(TargetPhone, AudioType);
 }
 
-void APlayerPhone::Multicast_PlayPhoneAudio_Implementation()
+void APlayerPhone::Multicast_PlayPhoneAudio_Implementation(APlayerPhone* TargetPhone, E_AudioType AudioType)
 {
-	if (PhoneAudioComponent)
+	if (!TargetPhone || !TargetPhone->PhoneAudioComponent || !TargetPhone->PhoneAudioRingtoneComp
+		|| !AkRingtoneEvent || !AkLeftEvent || !AkRightEvent || !AkBackEvent || !AkConfirmEvent
+		|| !AkOpenPhoneEvent || !AkClosePhoneEvent)
 	{
-		PhoneAudioComponent->SetSound(RingtoneSoundWave);
-		PhoneAudioComponent->Play();
+		return;
 	}
+
+	switch (AudioType)
+	{
+	case E_AudioType::Ringtone:
+		TargetPhone->PhoneAudioRingtoneComp->SetSound(RingtoneSoundWave);
+		TargetPhone->PhoneAudioRingtoneComp->Play();
+
+		//PlayWwiseEvent(AkRingtoneEvent, TargetPhone);
+		break;
+
+	case E_AudioType::Left:
+		TargetPhone->PhoneAudioComponent->SetSound(LeftSoundWave);
+		TargetPhone->PhoneAudioComponent->Play();
+
+		//PlayWwiseEvent(AkLeftEvent, TargetPhone);
+		break;
+
+	case E_AudioType::Right:
+		TargetPhone->PhoneAudioComponent->SetSound(RightSoundWave);
+		TargetPhone->PhoneAudioComponent->Play();
+
+		//PlayWwiseEvent(AkRightEvent, TargetPhone);
+		break;
+
+	case E_AudioType::Back:
+		TargetPhone->PhoneAudioComponent->SetSound(BackSoundWave);
+		TargetPhone->PhoneAudioComponent->Play();
+
+		//PlayWwiseEvent(AkBackEvent, TargetPhone);
+		break;
+
+	case E_AudioType::Confirm:
+		TargetPhone->PhoneAudioComponent->SetSound(ConfirmSoundWave);
+		TargetPhone->PhoneAudioComponent->Play();
+
+		//PlayWwiseEvent(AkConfirmEvent, TargetPhone);
+		break;
+
+	case E_AudioType::Open:
+		TargetPhone->PhoneAudioComponent->SetSound(OpenPhoneSoundWave);
+		TargetPhone->PhoneAudioComponent->Play();
+
+		//PlayWwiseEvent(AkOpenPhoneEvent, TargetPhone);
+		break;
+
+	case E_AudioType::Close:
+		TargetPhone->PhoneAudioComponent->SetSound(ClosePhoneSoundWave);
+		TargetPhone->PhoneAudioComponent->Play();
+
+		//PlayWwiseEvent(AkClosePhoneEvent, TargetPhone);
+		break;
+	}
+}
+
+void APlayerPhone::Server_StopPhoneAudio_Implementation(APlayerPhone* TargetPhone)
+{
+	if (!TargetPhone || !TargetPhone->PhoneAudioComponent || !TargetPhone->PhoneAudioRingtoneComp)
+	{
+		return;
+	}
+
+	Multicast_StopPhoneAudio(TargetPhone);
+}
+
+void APlayerPhone::Multicast_StopPhoneAudio_Implementation(APlayerPhone* TargetPhone)
+{
+	if (!TargetPhone || !TargetPhone->PhoneAudioComponent || !TargetPhone->PhoneAudioRingtoneComp)
+	{
+		return;
+	}
+
+	TargetPhone->PhoneAudioComponent->Stop();
+	TargetPhone->PhoneAudioRingtoneComp->Stop();
 }
 
 void APlayerPhone::Server_CallPlayerByState_Implementation(APlayerState* TargetPlayerState, APlayerState* CallerPlayerState)
 {
 
+	// Check to see if either player is currently in a call
 	if (GetPhoneFromPlayerState(TargetPlayerState)->bIsInCall || GetPhoneFromPlayerState(CallerPlayerState)->bIsInCall)
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("One or both of the call players are currently in a call."));
 		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Red,
-TEXT("One or both of the call players are currently in a call."));
+			TEXT("One or both of the call players are currently in a call."));
+
+		// Post a delegate here for OnBusyLine() or something equivalent
+
 		return;
 	}
-	
+
 	// Get our current world ref
 	const UWorld* World = GetWorld();
 	if (!World)
@@ -164,7 +269,7 @@ TEXT("One or both of the call players are currently in a call."));
 	if (!OnsetVoipWorldSubsystem)
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("OnsetVoipWorldSubsystem is NULL!"));
-		return;	
+		return;
 	}
 
 	// Get the caller's VOIPTalker
@@ -172,7 +277,7 @@ TEXT("One or both of the call players are currently in a call."));
 	if (!CallerPlayerTalker)
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("CallerPlayerTalker is NULL!"));
-		return;	
+		return;
 	}
 
 	// First check if Channel 1 is free
@@ -180,17 +285,11 @@ TEXT("One or both of the call players are currently in a call."));
 	if (TalkersInChannel1.Num() == 0)
 	{
 		// It's free, so join it and ask the receiver to join it too
-		CallerPlayerTalker->SetVoiceChannel(1,true);
+		CallerPlayerTalker->SetVoiceChannel(1, true);
 		UE_LOG(LogPlayerPhone, Log, TEXT("A player caller joined Phone Channel 1."));
 		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Green,
-	TEXT("A player caller joined Phone Channel 1!"));
+			TEXT("A player caller joined Phone Channel 1!"));
 
-		// Set the replicated flag bIsInCall to true for the caller's phone
-		Server_SetIsInCall(true, GetPhoneFromPlayerState(CallerPlayerState));
-		// TEMP UNTIL ACCEPTING CALLS ARE IN!
-		// Set the target player's phone flag bIsInCall to true
-		Server_SetIsInCall(true, GetPhoneFromPlayerState(TargetPlayerState));
-		
 		// Notify the receiving player and the calling player
 		Server_NotifyClientsAboutCallByState(TargetPlayerState, CallerPlayerState, 1);
 		return;
@@ -204,14 +303,8 @@ TEXT("One or both of the call players are currently in a call."));
 		CallerPlayerTalker->SetVoiceChannel(2, true);
 		UE_LOG(LogPlayerPhone, Log, TEXT("Caller joined Phone Channel 2."));
 		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Green,
-TEXT("Joined Phone Channel 2!"));
+			TEXT("Joined Phone Channel 2!"));
 
-		// Set the replicated flag bIsInCall to true for the caller's phone
-		Server_SetIsInCall(true, GetPhoneFromPlayerState(CallerPlayerState));
-		// TEMP UNTIL ACCEPTING CALLS ARE IN!
-		// Set the target player's phone flag bIsInCall to true
-		Server_SetIsInCall(true, GetPhoneFromPlayerState(TargetPlayerState));
-		
 		// Notify the receiving player and the calling player
 		Server_NotifyClientsAboutCallByState(TargetPlayerState, CallerPlayerState, 2);
 		return;
@@ -219,7 +312,7 @@ TEXT("Joined Phone Channel 2!"));
 
 	// Both Phone Channels are taken, wait for one to be free
 	UE_LOG(LogPlayerPhone, Warning, TEXT("Both Phone Channels are taken! Wait for one to be free."));
-	
+
 	GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red,
 		TEXT("Both Phone Channels are taken! Wait for one to be free."));
 }
@@ -227,7 +320,7 @@ TEXT("Joined Phone Channel 2!"));
 void APlayerPhone::Server_LeaveCurrentPhoneChannel_Implementation(APlayerState* PlayerToChange)
 {
 	GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red,
-TEXT("Server_LeaveCurrentPhoneChannel_Implementation."));
+		TEXT("Server_LeaveCurrentPhoneChannel_Implementation."));
 
 	if (bIsLeavingCall)
 	{
@@ -237,14 +330,14 @@ TEXT("Server_LeaveCurrentPhoneChannel_Implementation."));
 
 	// set our flag to true to avoid recursion
 	bIsLeavingCall = true;
-	
+
 	// Get the current world ref
 	const UWorld* const World = GEngine->GetWorldFromContextObject(GetWorld(), EGetWorldErrorMode::LogAndReturnNull);
 	if (!IsValid(World))
 	{
-		UE_LOG(LogPlayerPhone, Error, TEXT("Invalid World from RecievePhoneCall!"));
+		UE_LOG(LogPlayerPhone, Error, TEXT("Invalid World from Server_LeaveCurrentPhoneChannel!"));
 		GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red,
-TEXT("Invalid World from RecievePhoneCall!"));
+			TEXT("Invalid World from Server_LeaveCurrentPhoneChannel!"));
 		bIsLeavingCall = false;  // Reset flag before exiting
 		return;
 	}
@@ -255,9 +348,9 @@ TEXT("Invalid World from RecievePhoneCall!"));
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("OnsetVoipWorldSubsystem is NULL!"));
 		GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red,
-TEXT("OnsetVoipWorldSubsystem is NULL!"));
+			TEXT("OnsetVoipWorldSubsystem is NULL!"));
 		bIsLeavingCall = false;  // Reset flag before exiting
-		return;	
+		return;
 	}
 
 	// Get the player's VOIPTalker
@@ -267,7 +360,7 @@ TEXT("OnsetVoipWorldSubsystem is NULL!"));
 		UE_LOG(LogPlayerPhone, Error, TEXT("PlayerTalker is NULL!"));
 		GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red, TEXT("PlayerTalker is NULL!"));
 		bIsLeavingCall = false;  // Reset flag before exiting
-		return;	
+		return;
 	}
 
 	// Get Player Phone
@@ -277,59 +370,55 @@ TEXT("OnsetVoipWorldSubsystem is NULL!"));
 		UE_LOG(LogPlayerPhone, Error, TEXT("PlayerPhone is NULL!"));
 		GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red, TEXT("PlayerPhone is NULL!"));
 		bIsLeavingCall = false;  // Reset flag before exiting
-		return;	
+		return;
 	}
 
 	GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Yellow,
 		FString::Printf(TEXT("Current Channel: %d"), PlayerPhone->GetCurrentChannel()));
-	
+
+	// Just in case the ringtone is playing, stop playing any sounds on this phone
+	Multicast_StopPhoneAudio(PlayerPhone);
+
 	// Check the Player's current channel
 	if (PlayerPhone->GetCurrentChannel() != -1)
 	{
 		// Leave the current channel
 		PlayerTalker->SetVoiceChannel(PlayerPhone->GetCurrentChannel(), false);
-		// Notify any subscribers that this player left the call
+
+		// Notify any subscribers that this player left the call,
+		// must be done through the server because it's technically a multicast I believe
 		if (PlayerPhone->OnEndCall.IsBound())
 		{
 			GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red, TEXT("Executing OnEndCall delegate"));
-			//PlayerPhone->OnEndCall.ExecuteIfBound(PlayerToChange);
+
 			PlayerPhone->OnEndCall.Broadcast(PlayerToChange);
-			
+
 			// Unbind the delegate to prevent further executions
-			//PlayerPhone->OnEndCall.Unbind();
-			//PlayerPhone->OnEndCall.RemoveDynamic(OtherPlayerPhone, &APlayerPhone::OnOtherPlayerEndCall);
 			PlayerPhone->OnEndCall.Clear();
 		}
 
 		// Extra precaution, remove this talker from all phone channels
-		if (PlayerTalker->IsInVoiceChannel(1))
-		{
-			PlayerTalker->SetVoiceChannel(1, false);
-		}
-		if (PlayerTalker->IsInVoiceChannel(2))
-		{
-			PlayerTalker->SetVoiceChannel(2, false);
-		}
+		PlayerTalker->SetVoiceChannel(1, false);
+		PlayerTalker->SetVoiceChannel(2, false);
 
 		// Reset the current channel tracker
 		PlayerPhone->SetCurrentChannel(-1);
 
 		// Set the replicated flag for bIsInCall to false for this phone
-		Server_SetIsInCall(false, PlayerPhone);
-		
+		PlayerPhone->bIsInCall = false;
+
 		GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red,
-	TEXT("Left current call."));
+			TEXT("Someone left their current call."));
 	}
 	else
 	{
 		UE_LOG(LogPlayerPhone, Log, TEXT("Trying to leave a channel when we arent in one currently!"));
 	}
-	
-	// Broadcast the Blueprintable OnCallEnded Event
-	//PlayerPhone->OnCallEnded.Broadcast();
+
+	// Broadcast the Blueprintable OnCallEnded Event through the owning client's machine
 	Client_BroadcastOnCallEnded();
-	
-	
+
+
 	// Reset flag before exiting
 	bIsLeavingCall = false;
 }
@@ -341,6 +430,10 @@ void APlayerPhone::Server_SetIsInCall_Implementation(const bool newVal, APlayerP
 
 void APlayerPhone::Client_BindOnEndCall_Implementation(APlayerPhone* OtherPlayerPhone)
 {
+	// THIS is a phone that is in a call with another phone.
+	// We are binding THIS OnEndCall delegate to THE OTHER phone's OnOtherPlayerEndCall().
+	// So when THIS phone broadcasts OnEndCall, THE OTHER phone will run OnOtherPlayerEndCall()
+	// and pass in the PlayerState that owns THIS phone.
 	if (OtherPlayerPhone)
 	{
 		OnEndCall.AddUniqueDynamic(OtherPlayerPhone, &APlayerPhone::OnOtherPlayerEndCall);
@@ -349,6 +442,7 @@ void APlayerPhone::Client_BindOnEndCall_Implementation(APlayerPhone* OtherPlayer
 
 void APlayerPhone::Client_UnbindOnEndCall_Implementation(APlayerPhone* OtherPlayerPhone)
 {
+	// Same description as Client_BindOnEndCall but instead we are unbinding
 	if (OtherPlayerPhone)
 	{
 		OnEndCall.RemoveDynamic(OtherPlayerPhone, &APlayerPhone::OnOtherPlayerEndCall);
@@ -357,9 +451,22 @@ void APlayerPhone::Client_UnbindOnEndCall_Implementation(APlayerPhone* OtherPlay
 
 void APlayerPhone::Client_BroadcastOnCallEnded_Implementation()
 {
-	if(BPOnEndCall.IsBound())
+	if (BPOnEndCall.IsBound())
 	{
 		BPOnEndCall.Broadcast();
+	}
+}
+
+void APlayerPhone::Client_BroadcastOnEndCall_Implementation(APlayerState* OtherPlayerState)
+{
+	if (OnEndCall.IsBound())
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Red, TEXT("Executing OnEndCall delegate"));
+
+		OnEndCall.Broadcast(OtherPlayerState);
+
+		// Unbind the delegate to prevent further executions
+		OnEndCall.Clear();
 	}
 }
 
@@ -367,14 +474,62 @@ void APlayerPhone::AcceptCall()
 {
 	UE_LOG(LogPlayerPhone, Log, TEXT("Accepting received call"));
 
+	// Only work if we are being called currently
 	if (PhoneCallTimeoutHandle.IsValid())
 	{
 		// Clear the existing timer
 		GetWorldTimerManager().ClearTimer(PhoneCallTimeoutHandle);
+
+		// Tell the server that we accepted the call, pass in our player state
+		// and current channel
+		Server_AcceptCall(mOwningCharacter->GetPlayerState(), mCurrentChannel);
 	}
-	
+}
+
+void APlayerPhone::Server_AcceptCall_Implementation(APlayerState* ReceivingPlayerState, uint32 ChannelID)
+{
 	// Player now in a call
 	Server_SetIsInCall_Implementation(true, this);
+
+	GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Yellow, TEXT("Accepting a phone call."));
+	UE_LOG(LogPlayerPhone, Log, TEXT("Accepting a phone call."));
+
+	// Stop playing our ringtone if we are playing it
+	APlayerPhone* PlayerPhone = GetPhoneFromPlayerState(ReceivingPlayerState);
+	if (PlayerPhone->PhoneAudioComponent->IsPlaying())
+	{
+		Server_StopPhoneAudio(PlayerPhone);
+	}
+
+	// Get the current world ref
+	const UWorld* const World = GEngine->GetWorldFromContextObject(GetWorld(), EGetWorldErrorMode::LogAndReturnNull);
+	if (!IsValid(World))
+	{
+		UE_LOG(LogPlayerPhone, Error, TEXT("Invalid World from ReceivePhoneCall!"));
+		return;
+	}
+
+	// Get the OnsetVoipWorldSubsystem
+	const UOnsetVoipWorldSubsystem* OnsetVoipWorldSubsystem = World->GetSubsystem<UOnsetVoipWorldSubsystem>();
+	if (!OnsetVoipWorldSubsystem)
+	{
+		UE_LOG(LogPlayerPhone, Error, TEXT("OnsetVoipWorldSubsystem is NULL!"));
+		return;
+	}
+
+	// Get the receiving player's VOIPTalker
+	UOnsetVoipTalker* ReceivingPlayerTalker = OnsetVoipWorldSubsystem->GetVoipTalker(ReceivingPlayerState);
+	if (!ReceivingPlayerTalker)
+	{
+		UE_LOG(LogPlayerPhone, Error, TEXT("ReceivingPlayerTalker is NULL!"));
+		return;
+	}
+
+	// Officially join the channel
+	ReceivingPlayerTalker->SetVoiceChannel(ChannelID, true);
+
+	UE_LOG(LogPlayerPhone, Log, TEXT("Phone call successfully received and joined!"));
+	GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Green, TEXT("Phone call successfully received and joined!"));
 }
 
 void APlayerPhone::PhoneSkeleSetHidden(bool bHide) const
@@ -388,52 +543,83 @@ void APlayerPhone::PhoneSkeleSetHidden(bool bHide) const
 	}
 }
 
-APlayerPhone* APlayerPhone::GetPhoneFromPlayerState(const APlayerState* PlayerState)
+APlayerPhone* APlayerPhone::GetPhoneFromPlayerState(APlayerState* PlayerState)
 {
-	if (!PlayerState)
+	AQUPlayerState* QUPS = Cast<AQUPlayerState>(PlayerState);
+	if (!QUPS)
 	{
-		UE_LOG(LogPlayerPhone, Error, TEXT("PlayerState is NULL!"));
 		return nullptr;
 	}
 
-	const APlayerController* PlayerController = PlayerState->GetPlayerController();
-	if (!PlayerController)
-	{
-		UE_LOG(LogPlayerPhone, Error, TEXT("PlayerController is NULL!"));
-		return nullptr;
-	}
-
-	const ANetworkingPrototypeCharacter* PlayerCharacter = Cast<ANetworkingPrototypeCharacter>(PlayerController->GetPawn());
-	if (!PlayerCharacter)
-	{
-		UE_LOG(LogPlayerPhone, Error, TEXT("PlayerCharacter is NULL!"));
-		return nullptr;
-	}
-
-	APlayerPhone* PlayerPhone = PlayerCharacter->GetPlayerPhone();
-	if (!PlayerPhone)
-	{
-		UE_LOG(LogPlayerPhone, Error, TEXT("PlayerPhone is NULL!"));
-		return nullptr;
-	}
-
-	return PlayerPhone;
+	return QUPS->GetPlayerPhone();
 }
 
 void APlayerPhone::OnOtherPlayerEndCall(APlayerState* OtherPlayerState)
 {
-	GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
-	TEXT("Other player ended call, disconnecting you from channel."));
-	
-	const UWorld* World = GetWorld();
-	if (!World)
+	if (HasAuthority())
 	{
-		UE_LOG(LogPlayerPhone, Error, TEXT("World is NULL!"));
-		return;
+		// If this was called on the server but this phone isn't owned by the server player,
+		// then we tell the owner of this phone to react to the other player (probably server player)
+		// ending the call
+		Client_OnOtherPlayerEndCall(OtherPlayerState);
 	}
-	
+	else
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
+			TEXT("Other player ended call, disconnecting you from channel."));
+
+		// Get the world
+		const UWorld* World = GetWorld();
+		if (!World)
+		{
+			UE_LOG(LogPlayerPhone, Error, TEXT("World is NULL!"));
+			return;
+		}
+
+		// Get our local player's state
+		APlayerState* LocalPlayerState = UGameplayStatics::GetPlayerState(World, 0);
+		if (!LocalPlayerState || !LocalPlayerState->GetPlayerController()->IsLocalController())
+		{
+			UE_LOG(LogPlayerPhone, Error, TEXT("LocalPlayerState is NULL or is not the local controller!"));
+			return;
+		}
+
+		// Unbind OnEndCall to avoid recursion
+		if (OnEndCall.IsBound())
+		{
+			if (HasAuthority())
+			{
+				APlayerPhone* OtherPlayerPhone = GetPhoneFromPlayerState(OtherPlayerState);
+
+				// Client RPC called through the server will be ran on the OWNING CLIENT'S computer.
+				// In this case if we are the server player AND we own this phone, it will run on
+				// our computer which will technically still be on the sever
+				Client_UnbindOnEndCall(OtherPlayerPhone);
+			}
+			else
+			{
+				APlayerPhone* OtherPlayerPhone = GetPhoneFromPlayerState(OtherPlayerState);
+
+				// Client RPC called on a phone owned by THIS client will run on THIS client's computer
+				Client_UnbindOnEndCall(OtherPlayerPhone);
+			}
+		}
+
+		// We are no longer in a call
+		Server_SetIsInCall_Implementation(false, this);
+
+		// Get our local player to leave the channel
+		Server_LeaveCurrentPhoneChannel(LocalPlayerState);
+	}
+}
+
+void APlayerPhone::Client_OnOtherPlayerEndCall_Implementation(APlayerState* OtherPlayerState)
+{
+	GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
+		TEXT("Other player ended call, disconnecting you from channel."));
+
 	// Get our local player's state
-	APlayerState* LocalPlayerState = UGameplayStatics::GetPlayerState(World, 0);
+	APlayerState* LocalPlayerState = mOwningCharacter->GetPlayerState();
 	if (!LocalPlayerState || !LocalPlayerState->GetPlayerController()->IsLocalController())
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("LocalPlayerState is NULL or is not the local controller!"));
@@ -443,17 +629,27 @@ void APlayerPhone::OnOtherPlayerEndCall(APlayerState* OtherPlayerState)
 	// Unbind OnEndCall to avoid recursion
 	if (OnEndCall.IsBound())
 	{
-		APlayerPhone* OtherPlayerPhone = GetPhoneFromPlayerState(OtherPlayerState);
-		Client_UnbindOnEndCall(OtherPlayerPhone);
+		if (HasAuthority())
+		{
+			APlayerPhone* OtherPlayerPhone = GetPhoneFromPlayerState(OtherPlayerState);
+
+			// Client RPC called through the server will be ran on the OWNING CLIENT'S computer.
+			// In this case if we are the server player AND we own this phone, it will run on
+			// our computer which will technically still be on the sever
+			Client_UnbindOnEndCall(OtherPlayerPhone);
+		}
+		else
+		{
+			APlayerPhone* OtherPlayerPhone = GetPhoneFromPlayerState(OtherPlayerState);
+
+			// Client RPC called on a phone owned by THIS client will run on THIS client's computer
+			Client_UnbindOnEndCall(OtherPlayerPhone);
+		}
 	}
-	// if (OnEndCall.IsBound())
-	// {
-	// 	OnEndCall.Unbind();
-	// }
 
 	// We are no longer in a call
 	Server_SetIsInCall_Implementation(false, this);
-	
+
 	// Get our local player to leave the channel
 	Server_LeaveCurrentPhoneChannel(LocalPlayerState);
 }
@@ -462,8 +658,8 @@ void APlayerPhone::EndCall(APlayerState* PlayerEndingCall)
 {
 	UE_LOG(LogPlayerPhone, Log, TEXT("Ending current call"));
 	GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Red,
-TEXT("Ending current call"));
-	
+		TEXT("Ending current call"));
+
 	// No longer in a call
 	Server_SetIsInCall(false, this);
 
@@ -479,8 +675,17 @@ void APlayerPhone::PendingCallTimeout()
 		UE_LOG(LogPlayerPhone, Error, TEXT("mOwningCharacter->GetPlayerState() returned NULL!"));
 		return;
 	}
-	
+
+	// Automatically end the call
 	EndCall(OwningState);
+}
+
+void APlayerPhone::SetCurrentChannel(const int NewChannel)
+{
+	if (HasAuthority())
+	{
+		mCurrentChannel = NewChannel;
+	}
 }
 
 void APlayerPhone::PullUpPhone()
@@ -493,10 +698,10 @@ void APlayerPhone::PullUpPhone()
 		{
 			return;
 		}
-		
+
 		// Show the phone skeleton in game
 		PhoneSkeleSetHidden(false);
-		
+
 		// Play the phone pull up montage
 		AnimInstance->Montage_Play(PullPhoneUpMontage);
 
@@ -508,6 +713,9 @@ void APlayerPhone::PullUpPhone()
 		FOnMontageEnded MontageEndedDelegate;
 		MontageEndedDelegate.BindUObject(this, &APlayerPhone::KeepPhoneUp);
 		AnimInstance->Montage_SetEndDelegate(MontageEndedDelegate, PullPhoneUpMontage);
+
+		// Play Open phone audio
+		Server_PlayPhoneAudio(this, E_AudioType::Open);
 	}
 }
 
@@ -521,7 +729,7 @@ void APlayerPhone::KeepPhoneUp(UAnimMontage* Montage, bool bInterrupted)
 		{
 			return;
 		}
-		
+
 		// Ensure phone stays up
 		AnimInstance->Montage_Play(KeepPhoneUpMontage);
 	}
@@ -535,9 +743,74 @@ void APlayerPhone::OnPhonePutDown(UAnimMontage* Montage, bool bInterrupted)
 	{
 		return;
 	}
-	
-	// Hide the phone skeleton in game
+
 	PhoneSkeleSetHidden(true);
+}
+
+void APlayerPhone::NavLeft()
+{
+	if (mPlayerPhoneWidget)
+	{
+		Server_PlayPhoneAudio(this, E_AudioType::Left);
+		mPlayerPhoneWidget->NavigateLeft();
+	}
+}
+
+void APlayerPhone::NavRight()
+{
+	if (mPlayerPhoneWidget)
+	{
+		Server_PlayPhoneAudio(this, E_AudioType::Right);
+		mPlayerPhoneWidget->NavigateRight();
+	}
+}
+
+void APlayerPhone::NavConfirm()
+{
+	if (mPlayerPhoneWidget)
+	{
+		Server_PlayPhoneAudio(this, E_AudioType::Confirm);
+		mPlayerPhoneWidget->ConfirmSelection();
+	}
+}
+
+void APlayerPhone::NavBack()
+{
+	if (mPlayerPhoneWidget)
+	{
+		Server_PlayPhoneAudio(this, E_AudioType::Back);
+		mPlayerPhoneWidget->GoBack();
+	}
+}
+
+int32 APlayerPhone::PlayWwiseEvent(UAkAudioEvent* Event, AActor* TargetActor, bool bStopWhenAttachedToDestroyed)
+{
+	int32 PlayingId = AK_INVALID_PLAYING_ID;
+
+	if (Event)
+	{
+		FOnAkPostEventCallback nullCallback;
+		PlayingId = UAkGameplayStatics::PostEvent(Event, TargetActor, int32(0), nullCallback, bStopWhenAttachedToDestroyed);
+	}
+	else
+	{
+		UE_LOG(LogPlayerPhone, Error, TEXT("Wwise Event reference on APlayerPhone 'PlayWwiseEvent' is invalid"));
+	}
+
+	return PlayingId;
+}
+
+void APlayerPhone::AkExecuteAction(const AActor* Actor, UAkAudioEvent* Event, const AkActionOnEventType ActionType,
+	const int32 PlayingId, const int32 TransitionDuration, const EAkCurveInterpolation FadeCurve)
+{
+	if (Actor && Event)
+	{
+		Event->ExecuteAction(ActionType, Actor, PlayingId, TransitionDuration, FadeCurve);
+	}
+	else
+	{
+		UE_LOG(LogPlayerPhone, Error, TEXT("Actor/Event on APlayerPhone 'AkExecuteAction' is invalid"));
+	}
 }
 
 void APlayerPhone::PutDownPhone()
@@ -555,7 +828,7 @@ void APlayerPhone::PutDownPhone()
 		PhoneScreenWidgetPopUp->SetVisibility(false);
 		PhoneScreenLight->SetVisibility(false);
 		PhoneScreenPLight->SetVisibility(false);
-		
+
 		// Play the phone put-down montage
 		AnimInstance->Montage_Play(PutPhoneDownMontage);
 
@@ -567,11 +840,14 @@ void APlayerPhone::PutDownPhone()
 		FOnMontageEnded MontageEndedDelegate;
 		MontageEndedDelegate.BindUObject(this, &APlayerPhone::OnPhonePutDown);
 		AnimInstance->Montage_SetEndDelegate(MontageEndedDelegate, PutPhoneDownMontage);
+
+		// Play Close phone audio
+		Server_PlayPhoneAudio(this, E_AudioType::Close);
 	}
 }
 
 void APlayerPhone::Server_NotifyClientsAboutCallByState_Implementation(APlayerState* ReceivingPlayerState,
-                                                                       APlayerState* CallerPlayerState, int32 ChannelID)
+	APlayerState* CallerPlayerState, int32 ChannelID)
 {
 	// Get both player's phone by their states
 	APlayerPhone* CallerPhone = GetPhoneFromPlayerState(CallerPlayerState);
@@ -588,39 +864,50 @@ void APlayerPhone::Server_NotifyClientsAboutCallByState_Implementation(APlayerSt
 		return;
 	}
 
-	// Set mCurrentChannel on the receiver client's phone through the server
-	ReceiverPhone->SetCurrentChannel(ChannelID);
+	// Set the replicated flag bIsInCall to true for the caller's phone
+	CallerPhone->bIsInCall = true;
+
+	// Set the target player's phone flag bIsInCall to true
+	ReceiverPhone->bIsInCall = true;
+
 	// Set mCurrentChannel on the caller client's phone through the server
 	CallerPhone->SetCurrentChannel(ChannelID);
+	// Set mCurrentChannel on the receiver client's phone through the server
+	ReceiverPhone->SetCurrentChannel(ChannelID);
 
 	// Subscribe the receiver's phone to the Caller's phone to listen
-	// for when the caller ends the call
+	// for when the caller ends the call, must do here on the server (I believe it's because
+	// it's technically a multicast
 	CallerPhone->OnEndCall.AddUniqueDynamic(ReceiverPhone, &APlayerPhone::OnOtherPlayerEndCall);
-	
+
 	// Subscribe the Caller's phone to the Receiver's phone to listen
-	// for when the receiver ends the call
+	// for when the receiver ends the call, must do here on the server (I believe it's because
+	// it's technically a multicast
 	ReceiverPhone->OnEndCall.AddUniqueDynamic(CallerPhone, &APlayerPhone::OnOtherPlayerEndCall);
-	
+
+	// Play the ringtone through the server at the receiving phone's location
+	Multicast_PlayPhoneAudio(ReceiverPhone, E_AudioType::Ringtone);
+
 	Multicast_CallReceivingPlayerByState(ReceivingPlayerState, CallerPlayerState, CallerPhone, ReceiverPhone, ChannelID);
 }
 
 void APlayerPhone::Multicast_CallReceivingPlayerByState_Implementation(APlayerState* ReceivingPlayerState,
-	APlayerState* CallerPlayerState,APlayerPhone* CallerPhone, APlayerPhone* ReceiverPhone, int32 ChannelID)
+	APlayerState* CallerPlayerState, APlayerPhone* CallerPhone, APlayerPhone* ReceiverPhone, int32 ChannelID)
 {
 	GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, FString::Printf(
 		TEXT("Someone is asking another player to join their call.")));
-	
+
 	if (!ReceivingPlayerState || !CallerPlayerState || (ChannelID == 0))
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("Passed in info in Multicast_CallReceivingPlayerByState_Implementation is invalid!"));
-		return;	
+		return;
 	}
-	
+
 	const UWorld* World = GetWorld();
-	if(!World)
+	if (!World)
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("World is NULL!"));
-		return;	
+		return;
 	}
 
 	// Get the local player controller so we can get the local player state
@@ -628,7 +915,7 @@ void APlayerPhone::Multicast_CallReceivingPlayerByState_Implementation(APlayerSt
 	if (!LocalPlayerController)
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("LocalPlayerController is NULL!"));
-		return;	
+		return;
 	}
 
 	// Get the local player state through the controller since this is a listen server,
@@ -637,27 +924,29 @@ void APlayerPhone::Multicast_CallReceivingPlayerByState_Implementation(APlayerSt
 	if (!LocalPlayerState)
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("LocalPlayerState is NULL!"));
-		return;	
+		return;
 	}
-	
+
 	// Check to see if the local player state is the one being called
 	if (LocalPlayerState == ReceivingPlayerState)
 	{
 		// It is
 		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Green, FString::Printf(TEXT("YOU ARE THE RECEIVER!")));
-		
-		// Notify the receiving player that they are being called and send in the calling player's info 
+
+		// Notify the receiving player that they are being called and send in the calling player's info
+		// Start the call timeout timer
 		ReceiverPhone->Client_NotifyCallReceived(CallerPlayerState, CallerPhone, ChannelID);
 
 		// Call the local player and send in the caller ID
-		ReceiverPhone->Server_ReceivePhoneCall(LocalPlayerState, CallerPlayerState, ChannelID);
+		// Server side logic for joining the call (auto joins call if placed here)
+		//ReceiverPhone->Server_ReceivePhoneCall(LocalPlayerState, CallerPlayerState, ChannelID);
 	}
 	// Check to see if the local player is the caller
-	else if(LocalPlayerState == CallerPlayerState)
+	else if (LocalPlayerState == CallerPlayerState)
 	{
 		// It is
 		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Green, FString::Printf(TEXT("YOU ARE THE CALLER!")));
-		
+
 		// Notify the calling player that they started a call and send in the other player's info 
 		CallerPhone->Client_NotifyCallStarted(ReceivingPlayerState, ChannelID);
 	}
@@ -667,11 +956,12 @@ void APlayerPhone::Multicast_CallReceivingPlayerByState_Implementation(APlayerSt
 	}
 }
 
+// CURRENTLY NOT IN USE, ONLY USED WHEN WE WANT PLAYERS TO AUTOMATICALLY ACCEPT CALLS
 void APlayerPhone::Server_ReceivePhoneCall_Implementation(APlayerState* ReceivingPlayerState, APlayerState* CallerPlayerState, int32 ChannelID)
 {
 	GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Yellow, TEXT("Receiving a phone call."));
 	UE_LOG(LogPlayerPhone, Log, TEXT("Phone call received from player"));
-	
+
 	// Check if the passed params are valid
 	if (!CallerPlayerState || (ChannelID == 0))
 	{
@@ -683,7 +973,7 @@ void APlayerPhone::Server_ReceivePhoneCall_Implementation(APlayerState* Receivin
 	const UWorld* const World = GEngine->GetWorldFromContextObject(GetWorld(), EGetWorldErrorMode::LogAndReturnNull);
 	if (!IsValid(World))
 	{
-		UE_LOG(LogPlayerPhone, Error, TEXT("Invalid World from RecievePhoneCall!"));
+		UE_LOG(LogPlayerPhone, Error, TEXT("Invalid World from ReceivePhoneCall!"));
 		return;
 	}
 
@@ -692,7 +982,7 @@ void APlayerPhone::Server_ReceivePhoneCall_Implementation(APlayerState* Receivin
 	if (!OnsetVoipWorldSubsystem)
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("OnsetVoipWorldSubsystem is NULL!"));
-		return;	
+		return;
 	}
 
 	// Get the caller's VOIPTalker
@@ -700,7 +990,7 @@ void APlayerPhone::Server_ReceivePhoneCall_Implementation(APlayerState* Receivin
 	if (!CallerPlayerTalker)
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("CallerPlayerTalker is NULL!"));
-		return;	
+		return;
 	}
 
 	// Get the receiving player's VOIPTalker
@@ -708,11 +998,8 @@ void APlayerPhone::Server_ReceivePhoneCall_Implementation(APlayerState* Receivin
 	if (!ReceivingPlayerTalker)
 	{
 		UE_LOG(LogPlayerPhone, Error, TEXT("ReceivingPlayerTalker is NULL!"));
-		return;	
+		return;
 	}
-
-	// Broadcast the delegate for receiving a call
-	//OnCallReceived.ExecuteIfBound(CallerPlayerState);
 
 	// Check to see if the caller player's talker is still in the channel, if so join it, if not cancel everything
 	const TArray<UOnsetVoipTalker*> TalkersInChannel = OnsetVoipWorldSubsystem->GetAllTalkersInVoiceChannel(ChannelID);
@@ -733,7 +1020,7 @@ void APlayerPhone::Server_ReceivePhoneCall_Implementation(APlayerState* Receivin
 			break;
 		}
 	}
-	
+
 	UE_LOG(LogPlayerPhone, Log, TEXT("Phone call successfully received and joined!"));
 	GEngine->AddOnScreenDebugMessage(-1, 1.0f, FColor::Green, TEXT("Phone call successfully received and joined!"));
 }
